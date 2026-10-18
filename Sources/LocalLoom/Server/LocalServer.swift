@@ -42,13 +42,9 @@ class LocalServer {
     }
 
     private func setupRoutes(_ server: HttpServer) {
-        // GET / — redirect to most recent recording or show empty page
-        server["/"] = { [weak self] request in
-            guard let self = self else { return .notFound }
-            if let latest = self.getRecordings?().first {
-                return .movedPermanently("/v/\(latest.id)")
-            }
-            return .ok(.html(VideoPlayerHTML.noRecordingsPage()))
+        // GET / — never reveal recordings; a share link is the only way to reach one
+        server["/"] = { _ in
+            return .ok(.html(VideoPlayerHTML.notFoundPage()))
         }
 
         // GET /v/:id — HTML video player page
@@ -73,7 +69,12 @@ class LocalServer {
                 return .notFound
             }
 
-            let filePath = self.recordingsDirectory.appendingPathComponent(filename).path
+            // Only serve files that belong to a known recording. Swifter percent-decodes
+            // path params after splitting, so "..%2F" would otherwise escape the folder.
+            guard let recording = self.getRecordings?().first(where: { $0.fileName == filename }) else {
+                return .notFound
+            }
+            let filePath = recording.fileURL.path
 
             guard FileManager.default.fileExists(atPath: filePath) else {
                 return .notFound
