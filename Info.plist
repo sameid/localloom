@@ -28,5 +28,11 @@
     <string>LocalLoom needs microphone access to record audio with your screen capture.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <!-- Lets the app reach its own server on 127.0.0.1, and self-hosted servers on the LAN -->
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
 </dict>
 </plist>

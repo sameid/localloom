@@ -1,14 +1,21 @@
 import Foundation
+import Security
 
 struct Recording: Identifiable, Codable {
     let id: String
-    let fileName: String
     let date: Date
     var duration: TimeInterval
-    var filePath: String
+    let size: Int64
+    /// Fixed when the recording is made, so switching modes later doesn't move it.
+    let destination: Destination
+    /// The share link a self-hosted server returned. "This Mac" links are built from the
+    /// ngrok address instead, since the local server can't know it.
+    var shareURL: String?
+    var isUploaded: Bool
 
-    var fileURL: URL {
-        URL(fileURLWithPath: filePath)
+    /// Where the file waits until the server has all of it.
+    var pendingFileURL: URL {
+        Recording.pendingDirectory.appendingPathComponent("\(id).mp4")
     }
 
     var formattedDuration: String {
@@ -24,29 +31,42 @@ struct Recording: Identifiable, Codable {
         return formatter.string(from: date)
     }
 
-    static func newRecording() -> Recording {
-        let id = UUID().uuidString.prefix(8).lowercased()
-        let fileName = "\(id).mp4"
-        let recordingsDir = Recording.recordingsDirectory
-        let filePath = recordingsDir.appendingPathComponent(fileName).path
-
-        return Recording(
-            id: String(id),
-            fileName: fileName,
-            date: Date(),
-            duration: 0,
-            filePath: filePath
-        )
+    /// 128 random bits, base64url. The share link is the only thing protecting a recording.
+    static func newID() -> String {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
-    static var recordingsDirectory: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("LocalLoom/recordings")
+    static var pendingDirectory: URL {
+        let dir = applicationSupport.appendingPathComponent("LocalLoom/pending")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
 
-    var tempFileURL: URL {
-        URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("localloom_\(id).mp4")
+    static var newTempFileURL: URL {
+        URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("localloom_\(UUID().uuidString).mp4")
+    }
+
+    private static var applicationSupport: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+    }
+}
+
+/// How recordings were stored before the server existed: files served straight from disk.
+struct LegacyRecording: Codable {
+    let id: String
+    let date: Date
+    let duration: TimeInterval
+    let filePath: String
+
+    static let storageKey = "LocalLoom.recordings"
+
+    static var recordingsDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("LocalLoom/recordings")
     }
 }

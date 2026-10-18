@@ -2,7 +2,7 @@ import Foundation
 
 class NgrokConfig: ObservableObject {
     @Published var authtoken: String {
-        didSet { UserDefaults.standard.set(authtoken, forKey: "NgrokAuthtoken") }
+        didSet { SecretStore.shared.set(authtoken, for: "ngrokAuthtoken") }
     }
     @Published var subdomain: String {
         didSet { UserDefaults.standard.set(subdomain, forKey: "NgrokSubdomain") }
@@ -12,10 +12,12 @@ class NgrokConfig: ObservableObject {
         !authtoken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    var domain: String {
+    /// nil lets ngrok use the account's own free domain. A shared default can't work:
+    /// each ngrok domain belongs to a single account.
+    var domain: String? {
         let sub = subdomain.trimmingCharacters(in: .whitespacesAndNewlines)
         if sub.isEmpty {
-            return "localloom.ngrok.io"
+            return nil
         }
         // If user provides a full domain (e.g., myapp.ngrok-free.app), use it as-is
         if sub.contains(".") {
@@ -25,7 +27,15 @@ class NgrokConfig: ObservableObject {
     }
 
     init() {
-        self.authtoken = UserDefaults.standard.string(forKey: "NgrokAuthtoken") ?? ""
-        self.subdomain = UserDefaults.standard.string(forKey: "NgrokSubdomain") ?? "localloom"
+        // Earlier versions kept the authtoken in UserDefaults; move it to the keychain.
+        if let legacy = UserDefaults.standard.string(forKey: "NgrokAuthtoken") {
+            if SecretStore.shared.get("ngrokAuthtoken") == nil {
+                SecretStore.shared.set(legacy, for: "ngrokAuthtoken")
+            }
+            UserDefaults.standard.removeObject(forKey: "NgrokAuthtoken")
+        }
+
+        self.authtoken = SecretStore.shared.get("ngrokAuthtoken") ?? ""
+        self.subdomain = UserDefaults.standard.string(forKey: "NgrokSubdomain") ?? ""
     }
 }

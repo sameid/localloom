@@ -4,7 +4,8 @@ import AppKit
 struct MenuBarView: View {
     @ObservedObject var recordingManager: RecordingManager
     @ObservedObject var ngrokManager: NgrokManager
-    @ObservedObject var ngrokConfig: NgrokConfig
+    @ObservedObject var serverConfig: ServerConfig
+    @ObservedObject var bundledServer: BundledServer
 
     var onCopyLink: ((Recording) -> Void)?
     var onOpenPreferences: (() -> Void)?
@@ -36,27 +37,41 @@ struct MenuBarView: View {
             Divider()
                 .padding(.vertical, 4)
 
-            // Tunnel status
-            HStack {
-                Circle()
-                    .fill(ngrokManager.isRunning ? Color.green : Color.orange)
-                    .frame(width: 8, height: 8)
-                Text(ngrokManager.isRunning ? "Tunnel active" : "Tunnel inactive")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                if let url = ngrokManager.publicURL {
-                    Spacer()
-                    Text(url.replacingOccurrences(of: "https://", with: ""))
-                        .font(.caption2)
+            // Destination status
+            if serverConfig.destination == .thisMac {
+                HStack {
+                    Circle()
+                        .fill(ngrokManager.isRunning ? Color.green : Color.orange)
+                        .frame(width: 8, height: 8)
+                    Text(ngrokManager.isRunning ? "Tunnel active" : "Tunnel inactive")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if let url = ngrokManager.publicURL {
+                        Spacer()
+                        Text(url.replacingOccurrences(of: "https://", with: ""))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+            } else {
+                HStack {
+                    Image(systemName: "server.rack")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text(serverConfig.serverBaseURL?.host.map { "Uploading to \($0)" } ?? "No server set")
+                        .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                 }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
 
             // Error display
-            if let error = recordingManager.lastError ?? ngrokManager.lastError {
+            if let error = recordingManager.lastError ?? destinationError {
                 HStack {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.yellow)
@@ -87,10 +102,13 @@ struct MenuBarView: View {
                     .padding(.horizontal, 4)
                     .padding(.bottom, 4)
 
-                ForEach(recordingManager.recordings) { recording in
+                ForEach(recordingManager.recordings.prefix(10)) { recording in
                     RecordingRow(
                         recording: recording,
+                        progress: recordingManager.uploadProgress[recording.id],
+                        error: recordingManager.uploadErrors[recording.id],
                         onCopyLink: { onCopyLink?(recording) },
+                        onRetry: { recordingManager.retryUploads() },
                         onDelete: { recordingManager.deleteRecording(recording) }
                     )
                 }
@@ -126,11 +144,19 @@ struct MenuBarView: View {
         .padding(8)
         .frame(width: 300)
     }
+
+    private var destinationError: String? {
+        guard serverConfig.destination == .thisMac else { return nil }
+        return bundledServer.lastError ?? ngrokManager.lastError
+    }
 }
 
 struct RecordingRow: View {
     let recording: Recording
+    let progress: Double?
+    let error: String?
     let onCopyLink: () -> Void
+    let onRetry: () -> Void
     let onDelete: () -> Void
 
     var body: some View {
@@ -146,10 +172,24 @@ struct RecordingRow: View {
                     Text(recording.formattedDate)
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                    if let status = uploadStatus {
+                        Text(status)
+                            .font(.caption2)
+                            .foregroundColor(error == nil ? .secondary : .red)
+                    }
                 }
             }
 
             Spacer()
+
+            if let error {
+                Button(action: onRetry) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .help("Upload failed: \(error) Click to retry.")
+            }
 
             Button(action: onCopyLink) {
                 Image(systemName: "link")
@@ -168,5 +208,12 @@ struct RecordingRow: View {
         }
         .padding(.horizontal, 4)
         .padding(.vertical, 3)
+    }
+
+    private var uploadStatus: String? {
+        if recording.isUploaded { return nil }
+        if error != nil { return "Upload failed" }
+        if let progress { return "Uploading \(Int(progress * 100))%" }
+        return "Waiting to upload"
     }
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @main
 struct LocalLoomApp: App {
@@ -10,7 +11,8 @@ struct LocalLoomApp: App {
             MenuBarView(
                 recordingManager: appDelegate.recordingManager,
                 ngrokManager: appDelegate.ngrokManager,
-                ngrokConfig: appDelegate.ngrokConfig,
+                serverConfig: appDelegate.serverConfig,
+                bundledServer: appDelegate.bundledServer,
                 onCopyLink: { recording in
                     appDelegate.copyLinkForRecording(recording)
                 },
@@ -25,7 +27,7 @@ struct LocalLoomApp: App {
         }
 
         Window("LocalLoom Preferences", id: "preferences") {
-            PreferencesView(ngrokConfig: appDelegate.ngrokConfig)
+            PreferencesView(ngrokConfig: appDelegate.ngrokConfig, serverConfig: appDelegate.serverConfig)
         }
         .windowResizability(.contentSize)
         .defaultPosition(.center)
@@ -35,27 +37,26 @@ struct LocalLoomApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let recordingManager = RecordingManager()
     let ngrokConfig = NgrokConfig()
+    let serverConfig = ServerConfig()
     lazy var ngrokManager = NgrokManager(config: ngrokConfig)
-    let localServer = LocalServer()
+    let bundledServer = BundledServer()
     var keyboardShortcut: GlobalKeyboardShortcut?
 
-    private var serverPort: UInt16 = 0
+    private var cancellables = Set<AnyCancellable>()
+    /// The port ngrok was last pointed at
+    private var tunnelPort: UInt16 = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Request notification permission
         NotificationHelper.shared.requestPermission()
 
-        // Wire up local server to recording manager
-        localServer.getRecordings = { [weak self] in
-            return self?.recordingManager.recordings ?? []
-        }
+        // Wire the recording manager to wherever recordings are shared from
+        recordingManager.currentDestination = { [unowned self] in self.serverConfig.destination }
+        recordingManager.clientFor = { [unowned self] in self.client(for: $0) }
+        recordingManager.shareLink = { [unowned self] in self.shareLink(for: $0) }
 
-        // Start the local HTTP server
-        do {
-            serverPort = try localServer.start()
-        } catch {
-            print("[App] Failed to start server: \(error.localizedDescription)")
-            recordingManager.lastError = "Failed to start local server: \(error.localizedDescription)"
+        bundledServer.onReady = { [weak self] port in
+            self?.localServerReady(port: port)
         }
 
         // Register global keyboard shortcut
@@ -64,16 +65,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         }
         keyboardShortcut?.register()
 
-        // Setup recording completion handler to auto-share
-        setupRecordingShareHandler()
+        // Start whatever the chosen destination needs, now and whenever it changes.
+        // (@Published emits before the value is stored, hence receive(on:) before reading it.)
+        serverConfig.$destination
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.applyDestination() }
+            .store(in: &cancellables)
 
-        // Start ngrok if configured
-        if ngrokConfig.isConfigured && serverPort > 0 {
-            ngrokManager.start(port: serverPort)
-        }
+        // A fixed server address or token may unblock failed uploads
+        Publishers.CombineLatest(serverConfig.$serverURL, serverConfig.$serverToken)
+            .debounce(for: .seconds(1), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in self?.recordingManager.retryUploads() }
+            .store(in: &cancellables)
 
-        // If ngrok is not configured, prompt preferences on first launch
-        if !ngrokConfig.isConfigured {
+        // Start the tunnel as soon as an authtoken is entered
+        ngrokConfig.$authtoken
+            .debounce(for: .seconds(1), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in self?.ensureTunnelRunning() }
+            .store(in: &cancellables)
+
+        // "This Mac" links are built from the ngrok address, which arrives after launch
+        ngrokManager.$publicURL
+            .compactMap { $0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.recordingManager.copyWaitingLinks() }
+            .store(in: &cancellables)
+
+        // If the chosen destination is not set up yet, prompt preferences on launch
+        if !isDestinationConfigured {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 self.openPreferences()
             }
@@ -82,7 +102,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     func applicationWillTerminate(_ notification: Notification) {
         ngrokManager.stop()
-        localServer.stop()
+        bundledServer.stop()
         keyboardShortcut?.unregister()
     }
 
@@ -93,7 +113,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     func copyLinkForRecording(_ recording: Recording) {
         ensureTunnelRunning()
 
-        let url = recordingManager.shareableURL(for: recording, tunnelURL: ngrokManager.publicURL)
+        guard let url = shareLink(for: recording) else {
+            NotificationHelper.shared.showNotification(title: "No Link Yet", body: noLinkReason(for: recording))
+            return
+        }
         ClipboardHelper.copyToClipboard(url)
         NotificationHelper.shared.showNotification(
             title: "Link Copied",
@@ -117,7 +140,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     private func showPreferencesWindow() {
-        let prefsView = PreferencesView(ngrokConfig: ngrokConfig)
+        let prefsView = PreferencesView(ngrokConfig: ngrokConfig, serverConfig: serverConfig)
         let hostingController = NSHostingController(rootView: prefsView)
         let window = NSWindow(contentViewController: hostingController)
         window.title = "LocalLoom Preferences"
@@ -127,56 +150,82 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func setupRecordingShareHandler() {
-        // Observe when a new recording is added
-        var previousCount = recordingManager.recordings.count
+    // MARK: - Destinations
 
-        // We set up a timer to check for new recordings
-        // This is simpler than fighting with Combine in this context
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let currentCount = self.recordingManager.recordings.count
-
-            if currentCount > previousCount, let latest = self.recordingManager.recordings.first {
-                previousCount = currentCount
-
-                // Auto-share the new recording
-                self.ensureTunnelRunning()
-
-                // Give ngrok a moment to connect if it was just started
-                let checkAndCopy = { [weak self] in
-                    guard let self = self else { return }
-                    let url = self.recordingManager.shareableURL(
-                        for: latest,
-                        tunnelURL: self.ngrokManager.publicURL
-                    )
-                    ClipboardHelper.copyToClipboard(url)
-                    NotificationHelper.shared.showNotification(
-                        title: "Link Copied!",
-                        body: "Your recording is live at \(url)"
-                    )
-                }
-
-                if self.ngrokManager.publicURL != nil {
-                    checkAndCopy()
-                } else {
-                    // Wait a bit for ngrok to establish the tunnel
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                        checkAndCopy()
-                    }
-                }
-            }
-
-            // Keep in sync if recordings are deleted
-            if currentCount < previousCount {
-                previousCount = currentCount
-            }
+    private var isDestinationConfigured: Bool {
+        switch serverConfig.destination {
+        case .thisMac: return ngrokConfig.isConfigured
+        case .server: return serverConfig.serverClient != nil
         }
     }
 
+    private func applyDestination() {
+        switch serverConfig.destination {
+        case .thisMac:
+            // ngrok follows once the server is listening (localServerReady)
+            bundledServer.start(token: serverConfig.localToken)
+        case .server:
+            ngrokManager.stop()
+            bundledServer.stop()
+        }
+        recordingManager.processUploads()
+    }
+
+    private func localServerReady(port: UInt16) {
+        if tunnelPort != 0 && tunnelPort != port {
+            // The server came back on a different port; move the tunnel with it
+            tunnelPort = port
+            ngrokManager.restart(port: port)
+        } else {
+            ensureTunnelRunning()
+        }
+        recordingManager.processUploads()
+    }
+
     private func ensureTunnelRunning() {
-        guard serverPort > 0, ngrokConfig.isConfigured else { return }
+        guard serverConfig.destination == .thisMac, bundledServer.port > 0, ngrokConfig.isConfigured else { return }
+        tunnelPort = bundledServer.port
         // start() internally guards against double-launch via process != nil
-        ngrokManager.start(port: serverPort)
+        ngrokManager.start(port: bundledServer.port)
+    }
+
+    private func client(for destination: Destination) -> ServerClient? {
+        switch destination {
+        case .thisMac:
+            guard bundledServer.port > 0 else { return nil }
+            return ServerClient(
+                baseURL: URL(string: "http://127.0.0.1:\(bundledServer.port)")!,
+                token: serverConfig.localToken
+            )
+        case .server:
+            return serverConfig.serverClient
+        }
+    }
+
+    private func shareLink(for recording: Recording) -> String? {
+        switch recording.destination {
+        case .server:
+            return recording.shareURL
+        case .thisMac:
+            guard serverConfig.destination == .thisMac, ngrokConfig.isConfigured else { return nil }
+            // Before the tunnel reports its address, the configured domain is what it will use
+            guard let base = ngrokManager.publicURL ?? ngrokConfig.domain.map({ "https://\($0)" }) else {
+                return nil
+            }
+            return "\(base)/v/\(recording.id)"
+        }
+    }
+
+    private func noLinkReason(for recording: Recording) -> String {
+        switch recording.destination {
+        case .server:
+            return "Your server hasn't confirmed this recording yet. LocalLoom will keep trying."
+        case .thisMac where serverConfig.destination != .thisMac:
+            return "This recording is shared from this Mac. Switch back to This Mac in Preferences to share it."
+        case .thisMac where !ngrokConfig.isConfigured:
+            return "Add your ngrok authtoken in Preferences to share recordings from this Mac."
+        case .thisMac:
+            return "The ngrok tunnel is still connecting. Try again in a moment."
+        }
     }
 }

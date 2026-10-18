@@ -53,9 +53,9 @@ fi
 
 # Copy ngrok binary if it exists in various locations
 NGROK_SOURCE=""
-if [ -f "Sources/LocalLoom/Resources/ngrok" ]; then
+if [ -s "Sources/LocalLoom/Resources/ngrok" ]; then
     NGROK_SOURCE="Sources/LocalLoom/Resources/ngrok"
-elif [ -f "Resources/ngrok" ]; then
+elif [ -s "Resources/ngrok" ]; then
     NGROK_SOURCE="Resources/ngrok"
 elif command -v ngrok &> /dev/null; then
     NGROK_PATH=$(command -v ngrok)
@@ -71,6 +71,33 @@ else
     echo "==> WARNING: ngrok binary not found. The app will search for ngrok in PATH at runtime."
     echo "    To bundle ngrok, place it at Sources/LocalLoom/Resources/ngrok"
 fi
+
+# Bundle Node.js and localloom-server for "This Mac" mode. Official Node builds only link
+# system libraries (unlike Homebrew's), so the bundled copy runs on any Mac. Built for
+# this machine's architecture only.
+NODE_VERSION="24.18.0"
+case "$(uname -m)" in
+    arm64)  NODE_ARCH="arm64"; NODE_SHA256="e1a97e14c99c803e96c7339403282ea05a499c32f8d83defe9ef5ec66f979ed1" ;;
+    x86_64) NODE_ARCH="x64";   NODE_SHA256="dfd0dbd3e721503434df7b7205e719f61b3a3a31b2bcf9729b8b91fea240f080" ;;
+    *) echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+NODE_DIST="node-v${NODE_VERSION}-darwin-${NODE_ARCH}"
+NODE_CACHE=".build/node"
+
+if [ ! -f "${NODE_CACHE}/${NODE_DIST}/bin/node" ]; then
+    echo "==> Downloading Node.js ${NODE_VERSION} (${NODE_ARCH})..."
+    mkdir -p "${NODE_CACHE}"
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_DIST}.tar.gz" -o "${NODE_CACHE}/${NODE_DIST}.tar.gz"
+    echo "${NODE_SHA256}  ${NODE_CACHE}/${NODE_DIST}.tar.gz" | shasum -a 256 -c - >/dev/null
+    tar -xzf "${NODE_CACHE}/${NODE_DIST}.tar.gz" -C "${NODE_CACHE}" "${NODE_DIST}/bin/node"
+    rm "${NODE_CACHE}/${NODE_DIST}.tar.gz"
+fi
+
+cp "${NODE_CACHE}/${NODE_DIST}/bin/node" "${RESOURCES}/node"
+chmod 755 "${RESOURCES}/node"
+mkdir -p "${RESOURCES}/server"
+cp -R server/package.json server/src "${RESOURCES}/server/"
+echo "==> Bundled Node.js ${NODE_VERSION} and localloom-server"
 
 # Set executable permissions
 chmod 755 "${MACOS}/${APP_NAME}"

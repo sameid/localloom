@@ -18,10 +18,11 @@ class ScreenRecorder: NSObject, @unchecked Sendable {
     private let writerQueue = DispatchQueue(label: "com.localloom.assetwriter", qos: .userInitiated)
 
     private(set) var isRecording = false        // main-thread only
-    private(set) var currentRecording: Recording?
+    private var currentFileURL: URL?
 
     var onRecordingStarted: (() -> Void)?
-    var onRecordingStopped: ((Recording) -> Void)?
+    /// The finished file (in the temp directory) and its duration in seconds
+    var onRecordingStopped: ((URL, TimeInterval) -> Void)?
     var onError: ((Error) -> Void)?
 
     // MARK: - Public API (called on main thread)
@@ -65,8 +66,8 @@ class ScreenRecorder: NSObject, @unchecked Sendable {
     // MARK: - Setup
 
     private func setupAndStart(display: SCDisplay) throws {
-        let recording = Recording.newRecording()
-        self.currentRecording = recording
+        let tempURL = Recording.newTempFileURL
+        self.currentFileURL = tempURL
 
         // SCDisplay.width/height are in logical points. SCKit delivers sample buffers
         // at the backing pixel resolution, which we need to match in AVAssetWriter's
@@ -91,11 +92,6 @@ class ScreenRecorder: NSObject, @unchecked Sendable {
 
         // AVAssetWriter -- created here but NOT started yet.
         // startWriting() is called the first time a sample buffer arrives on writerQueue.
-        let tempURL = recording.tempFileURL
-
-        // Remove stale temp file if one exists from a previous crashed session
-        try? FileManager.default.removeItem(at: tempURL)
-
         let writer = try AVAssetWriter(outputURL: tempURL, fileType: .mp4)
 
         // Video settings must use the same pixel dimensions as the stream config.
@@ -193,49 +189,29 @@ class ScreenRecorder: NSObject, @unchecked Sendable {
                 return
             }
 
-            self.moveAndPublish()
+            self.publish()
         }
     }
 
-    private func moveAndPublish() {
+    private func publish() {
         // Still on writerQueue
-        guard var recording = currentRecording else { return }
+        guard let tempURL = currentFileURL else { return }
 
-        let tempURL = recording.tempFileURL
-        let finalURL = recording.fileURL
-
-        do {
-            // Load duration synchronously now that the file is complete
-            // Load duration asynchronously (all synchronous AVAsset accessors are deprecated on macOS 13+)
-            let asset = AVURLAsset(url: tempURL)
-            var duration: Double = 0
-            let durSemaphore = DispatchSemaphore(value: 0)
-            Task {
-                if let cmDuration = try? await asset.load(.duration) {
-                    duration = CMTimeGetSeconds(cmDuration)
-                }
-                durSemaphore.signal()
+        // Load duration asynchronously (all synchronous AVAsset accessors are deprecated on macOS 13+)
+        let asset = AVURLAsset(url: tempURL)
+        var duration: Double = 0
+        let durSemaphore = DispatchSemaphore(value: 0)
+        Task {
+            if let cmDuration = try? await asset.load(.duration) {
+                duration = CMTimeGetSeconds(cmDuration)
             }
-            durSemaphore.wait()
-            recording.duration = duration > 0 ? duration : 0
+            durSemaphore.signal()
+        }
+        durSemaphore.wait()
 
-            try FileManager.default.createDirectory(
-                at: Recording.recordingsDirectory,
-                withIntermediateDirectories: true
-            )
-
-            if FileManager.default.fileExists(atPath: finalURL.path) {
-                try FileManager.default.removeItem(at: finalURL)
-            }
-            try FileManager.default.moveItem(at: tempURL, to: finalURL)
-            recording.filePath = finalURL.path
-
-            DispatchQueue.main.async {
-                self.onRecordingStopped?(recording)
-            }
-        } catch {
-            print("[ScreenRecorder] Error moving file: \(error.localizedDescription)")
-            DispatchQueue.main.async { self.onError?(error) }
+        let finalDuration = duration > 0 ? duration : 0
+        DispatchQueue.main.async {
+            self.onRecordingStopped?(tempURL, finalDuration)
         }
 
         cleanupOnQueue()
@@ -247,7 +223,7 @@ class ScreenRecorder: NSObject, @unchecked Sendable {
         videoInput = nil
         audioInput = nil
         writerState = .idle
-        currentRecording = nil
+        currentFileURL = nil
         stream = nil
     }
 }

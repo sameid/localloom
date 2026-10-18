@@ -39,6 +39,12 @@ class NgrokManager: ObservableObject {
         launchNgrok(port: port)
     }
 
+    /// Points the tunnel at a new port, e.g. after the local server restarted elsewhere.
+    func restart(port: UInt16) {
+        stop()
+        start(port: port)
+    }
+
     func stop() {
         isShuttingDown = true
         killProcess()
@@ -69,15 +75,15 @@ class NgrokManager: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: ngrokPath)
 
+        // 127.0.0.1 rather than "localhost": the local server only listens on IPv4 loopback
         var arguments = [
-            "http", "\(port)",
+            "http", "127.0.0.1:\(port)",
             "--authtoken", config.authtoken.trimmingCharacters(in: .whitespacesAndNewlines),
             "--log", "stdout",
             "--log-format", "json",
         ]
 
-        let domain = config.domain.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !domain.isEmpty {
+        if let domain = config.domain {
             arguments.append(contentsOf: ["--domain", domain])
         }
 
@@ -113,7 +119,8 @@ class NgrokManager: ObservableObject {
         }
 
         process.terminationHandler = { [weak self] proc in
-            guard let self = self else { return }
+            // A process we replaced or stopped on purpose must not trigger retries
+            guard let self = self, self.process === proc else { return }
 
             // Drain any remaining buffered output
             if !self.lineBuffer.isEmpty {
@@ -152,8 +159,8 @@ class NgrokManager: ObservableObject {
         }
 
         do {
-            try process.run()
             self.process = process
+            try process.run()
             print("[NgrokManager] Started ngrok PID \(process.processIdentifier), args: \(arguments.joined(separator: " "))")
         } catch {
             self.process = nil
@@ -255,38 +262,8 @@ class NgrokManager: ObservableObject {
             if fm.fileExists(atPath: sibling.path) { return sibling.path }
         }
 
-        // 4. Common install locations
-        let candidates = [
-            "/opt/homebrew/bin/ngrok",        // Homebrew on Apple Silicon
-            "/usr/local/bin/ngrok",           // Homebrew on Intel / manual install
-            "\(NSHomeDirectory())/.local/bin/ngrok",
-            "\(NSHomeDirectory())/bin/ngrok",
-        ]
-        for path in candidates where fm.fileExists(atPath: path) {
-            return path
-        }
-
-        // 5. Ask the shell — handles nvm-style PATH shims and custom profiles
-        if let found = runWhich("ngrok") { return found }
-
-        return nil
-    }
-
-    private func runWhich(_ name: String) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        proc.arguments = ["-lc", "which \(name)"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        guard (try? proc.run()) != nil else { return nil }
-        proc.waitUntilExit()
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let path = output, !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
-            return nil
-        }
-        return path
+        // 4. Homebrew, manual installs, PATH
+        return ExecutableLocator.find("ngrok")
     }
 
     // MARK: - Teardown
