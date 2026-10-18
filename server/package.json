@@ -1,0 +1,18 @@
+{
+  "name": "localloom-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hostable server that stores and shares LocalLoom recordings",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "localloom-server": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

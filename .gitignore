@@ -29,3 +29,7 @@ LocalLoom.app/
 
 # Logs
 *.log
+
+# Server
+server/data/
+server/node_modules/

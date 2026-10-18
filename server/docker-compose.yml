@@ -1,0 +1,27 @@
+services:
+  localloom:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # The address viewers use. Share links are built from it.
+      LOCALLOOM_PUBLIC_URL: ${LOCALLOOM_PUBLIC_URL:-}
+    volumes:
+      - localloom-data:/data
+
+  # Optional, for servers without a public address (e.g. behind CGNAT):
+  #   NGROK_AUTHTOKEN=... NGROK_DOMAIN=you.ngrok-free.app \
+  #   LOCALLOOM_PUBLIC_URL=https://you.ngrok-free.app docker compose --profile ngrok up -d
+  ngrok:
+    image: ngrok/ngrok:latest
+    profiles: ["ngrok"]
+    restart: unless-stopped
+    command: ["http", "localloom:8080", "--domain", "${NGROK_DOMAIN:-}"]
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    depends_on:
+      - localloom
+
+volumes:
+  localloom-data:
